@@ -1,0 +1,6 @@
+processed_data/
+processed_sliding_window_data/
+ETH_datasets/
+.my_env
+bash.txt
+**/__pycache__/
