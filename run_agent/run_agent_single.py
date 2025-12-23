@@ -13,7 +13,6 @@ from agent.utils.debug import IS_DEBUG_ENV, ensure_cache_dirs, save_debug_image,
 from agent.utils.vllm_power import is_sleeping, wake_up
 from agent.utils.openai_wrapper import create_wrapped_client
 from data_loader.eth_data_loader import ETHLoader, collect_scenario_files
-from agent.utils.prompt_template import render_template
 from agent.utils.image_io import image_to_data_url
 from agent.utils.traj_draw import draw_trajectory_on_image
 
@@ -24,6 +23,29 @@ class Alternative(BaseModel):
 
 class TrajectoryAlternatives(BaseModel):
     alternatives: List[Alternative]
+
+# --- Prompt Template Loading (moved from agent.utils.prompt_template) ---
+class _SafeDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+def render_template(template_name: str, variables: Dict[str, Any]) -> str:
+    """Loads a prompt template from the 'visual_language/prompts' dir and renders it."""
+    # Resolve path relative to this script's location
+    # __file__ -> .../run_agent/run_agent_single.py
+    # -> dirname -> .../run_agent
+    # -> dirname -> .../
+    # -> join with 'visual_language/prompts'
+    project_root = Path(__file__).parent.parent
+    template_path = project_root / "agent" / "prompts" / f"{template_name}.md"
+    
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            template_str = f.read()
+        return template_str.format_map(_SafeDict(variables))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Prompt template not found at: {template_path}")
+
 
 # --- Configuration ---
 # Path to the root of the ETH/UCY datasets
@@ -59,27 +81,17 @@ def _convert_trajectory_to_int(points: np.ndarray) -> List[List[int]]:
     """Convert trajectory points to integers."""
     return [[int(point[0]), int(point[1])] for point in points]
 
-def prepare_template_data(agents_data: Dict[str, List[List[int]]]) -> Dict[str, Any]:
-    """Prepares template data for the 'case' strategy."""
-    # This function now directly handles the logic from CaseGenerator.prepare_template_data
-    # It receives the "agents" dictionary directly.
+def prepare_template_data(agent_id: str, agent_traj: List[List[int]], all_agents_data: Dict[str, List[List[int]]]) -> Dict[str, Any]:
+    """Prepares template data for a single agent within a window."""
     
-    if not agents_data:
-        raise ValueError("agents_data dictionary is empty.")
-
-    # For this example, let's assume we focus on the first agent in the window
-    first_agent_id = next(iter(agents_data))
-    first_agent_traj = np.array(agents_data[first_agent_id])
-    
-    traj_int = _convert_trajectory_to_int(first_agent_traj)
+    traj_int = agent_traj
     start_point = traj_int[0]
     
     return {
         'traj': traj_int,
-        'anno_text': f"Trajectory for agent {first_agent_id}", # Example annotation
+        'anno_text': f"Trajectory for agent {agent_id}", # Example annotation
         'start_point': start_point,
-        # You can add all agents' data if the prompt is designed for it
-        'all_agents_data': {pid: traj for pid, traj in agents_data.items()}
+        'all_agents_data': all_agents_data
     }
 
 def create_full_trajectory(original_traj_points: List[List[int]], predicted_points: List[List[float]]) -> np.ndarray:
@@ -111,7 +123,9 @@ async def run_generation_for_window(
     window_pack: Dict[str, Any],
     semaphore: asyncio.Semaphore,
 ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-    """Prepares and runs trajectory generation for a single data window."""
+    """
+    Prepares and runs trajectory generation for EACH AGENT in a single data window.
+    """
     
     # Unpack the data for the window
     image = window_pack["image"]
@@ -120,99 +134,97 @@ async def run_generation_for_window(
     scenario = window_pack["scenario"]
     start_frame, end_frame = window_info
     
-    traj_id = f"window_{start_frame:06d}_{end_frame:06d}"
-
-    # --- All generation logic is now in this function ---
-    
-    # 1. Prepare Template Data
-    if STRATEGY_NAME == "case":
-        # Pass the nested 'agents' dictionary to the prepare function
-        template_data = prepare_template_data(trajectory_data['agents'])
-        system_template = "gen_full_traj_system_v1"
-        user_template = "gen_full_traj_user_v1"
-        expected_pred_count = 19
-    else:
-        raise ValueError(f"Unknown strategy: {STRATEGY_NAME}")
-
-    width, height = get_image_dimensions(image)
-    template_data['image_size'] = f"{width}x{height}"
-
-    # 2. Render Prompts
-    system_prompt = render_template(system_template, template_data)
-    user_prompt = render_template(user_template, template_data)
-    
-    # 3. Prepare API Message
-    data_url = image_to_data_url(image)
-    user_content = [
-        {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-        {"type": "text", "text": user_prompt},
-    ]
-    
-    try:
-        scenario_mask = load_scenario_mask(scenario)
-        mask_data_url = image_to_data_url(scenario_mask)
-        user_content.insert(0, {"type": "image_url", "image_url": {"url": mask_data_url, "detail": "high"}})
-        save_debug_image(f'{scenario}_{traj_id}_mask', scenario_mask)
-    except FileNotFoundError as e:
-        print(f"[Warning] {e}, continuing without mask.")
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-
-    # 4. Call API
-    try:
-        async with semaphore:
-            resp = await client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                temperature=TEMPERATURE,
-                max_tokens=MAX_NEW_TOKENS,
-                response_format={"type": "json_object", "schema": TrajectoryAlternatives.model_json_schema()}
-            )
-    except Exception as e:
-        print(f"[Error] API call failed for idx={idx}, id={traj_id}: {e}")
+    agents_in_window = trajectory_data.get('agents', {})
+    if not agents_in_window:
         return idx, None
 
-    # 5. Parse and Process Response
-    parsed_json = json.loads(resp.choices[0].message.content or "{}")
-    
-    save_debug_text(f'{scenario}_{traj_id}_system_prompt.md', system_prompt)
-    save_debug_text(f'{scenario}_{traj_id}_user_prompt.md', user_prompt)
-    save_debug_image(f'{scenario}_{traj_id}_img', image)
-    save_debug_text(f'{scenario}_{traj_id}_traj.json', json.dumps(parsed_json, ensure_ascii=False, indent=2))
+    all_generated_trajectories_for_window = []
 
-    valid_trajectories = []
-    if "alternatives" in parsed_json:
-        # This logic focuses on the first agent, matching prepare_template_data
-        agents_data = trajectory_data['agents']
-        if not agents_data:
-            return idx, None # No agents in window to begin with
+    # --- Loop through each agent in the window and generate a trajectory for it ---
+    for agent_id, agent_traj_points in agents_in_window.items():
+        
+        agent_traj_id = f"window_{start_frame:06d}_agent_{agent_id}"
 
-        first_agent_id = next(iter(agents_data))
-        original_traj_points = agents_data[first_agent_id]
+        # 1. Prepare Template Data for this specific agent
+        if STRATEGY_NAME == "case":
+            template_data = prepare_template_data(agent_id, agent_traj_points, agents_in_window)
+            system_template = "case_system"
+            user_template = "case_user"
+            expected_pred_count = 19
+        else:
+            raise ValueError(f"Unknown strategy: {STRATEGY_NAME}")
 
-        for alt_idx, alternative in enumerate(parsed_json["alternatives"]):
-            points = alternative.get("points", [])
-            if len(points) != expected_pred_count:
-                continue # Validation failed
+        width, height = get_image_dimensions(image)
+        template_data['image_size'] = f"{width}x{height}"
 
-            full_traj = create_full_trajectory(original_traj_points, points)
-            
-            # Create debug image
-            img_with_traj = draw_trajectory_on_image(image, full_traj)
-            save_debug_image(f'{scenario}_{traj_id}_alt{alt_idx}', img_with_traj)
+        # 2. Render Prompts
+        system_prompt = render_template(system_template, template_data)
+        user_prompt = render_template(user_template, template_data)
+        
+        # 3. Prepare API Message
+        data_url = image_to_data_url(image)
+        user_content = [
+            {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+            {"type": "text", "text": user_prompt},
+        ]
+        
+        try:
+            scenario_mask = load_scenario_mask(scenario)
+            mask_data_url = image_to_data_url(scenario_mask)
+            user_content.insert(0, {"type": "image_url", "image_url": {"url": mask_data_url, "detail": "high"}})
+        except FileNotFoundError as e:
+            print(f"[Warning] {e}, continuing without mask.")
 
-            valid_trajectories.append({
-                "traj_id": f"{traj_id}_alt{alt_idx}",
-                "trajectory": full_traj,
-                "annotation": alternative.get("description", ""),
-                "filename": f"{scenario}_{traj_id}.jpg",
-                "scenario": scenario,
-            })
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
 
-    return idx, valid_trajectories
+        # 4. Call API
+        try:
+            async with semaphore:
+                resp = await client.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_completion_tokens=MAX_NEW_TOKENS,
+                    # response_format={"type": "json_object", "schema": TrajectoryAlternatives.model_json_schema()}
+                )
+        except Exception as e:
+            print(f"[Error] API call failed for agent {agent_id} in window {idx}: {e}")
+            continue # Move to the next agent
+
+        # 5. Parse and Process Response
+        parsed_json = json.loads(resp.choices[0].message.content or "{}")
+        
+        # Save debug files for each agent
+        debug_id = f'{scenario}_{agent_traj_id}'
+        save_debug_text(f'{debug_id}_system_prompt.md', system_prompt)
+        save_debug_text(f'{debug_id}_user_prompt.md', user_prompt)
+        save_debug_image(f'{debug_id}_img', image)
+        save_debug_text(f'{debug_id}_traj.json', json.dumps(parsed_json, ensure_ascii=False, indent=2))
+
+        if "alternatives" in parsed_json:
+            for alt_idx, alternative in enumerate(parsed_json["alternatives"]):
+                points = alternative.get("points", [])
+                if len(points) != expected_pred_count:
+                    continue # Validation failed
+
+                full_traj = create_full_trajectory(agent_traj_points, points)
+                
+                # Create debug image
+                img_with_traj = draw_trajectory_on_image(image.copy(), full_traj)
+                save_debug_image(f'{debug_id}_alt{alt_idx}', img_with_traj)
+
+                all_generated_trajectories_for_window.append({
+                    "traj_id": f"{agent_traj_id}_alt{alt_idx}",
+                    "trajectory": full_traj,
+                    "annotation": alternative.get("description", ""),
+                    "filename": f"{scenario}_{start_frame:06d}.jpg",
+                    "scenario": scenario,
+                })
+
+    return idx, all_generated_trajectories_for_window
 
 
 async def main_async():

@@ -5,6 +5,7 @@ import pickle
 import numpy as np
 # import pandas as pd
 import torch
+import shutil
 import networkx as nx
 from .util import *
 from torch.utils.data import Dataset, DataLoader
@@ -270,12 +271,17 @@ class ETHLoader():
         print(f"[Done] 共导出 {len(sampled_frames)} 张标注帧到 {save_dir}")
 
     def generate_window_records(
-                                    self,
-                                    save_dir: str,
-                                    window_size: int = 200,
-                                    stride: int | None = None,
-                                    radius: int = 4,
-                                ) -> None:
+        self,
+        save_dir: str,
+        scenario_name: str = "eth",
+        window_size: int = 200,
+        stride: int | None = None,
+        radius: int = 4,
+        mask_src_dir: str | None = None,
+        mask_keyword: str = "mask",  # 保留参数但不再使用（兼容你原来的调用）
+            ) -> None:
+
+   
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -288,6 +294,14 @@ class ETHLoader():
         if traj_data is None or len(traj_data) == 0:
             raise ValueError("self.processed_data is empty")
 
+        # =========================
+        # 固定拷贝的 mask 源文件（只做一次检查）
+        # =========================
+        mask_source_path = Path(mask_src_dir).resolve() / scenario_name / f"{scenario_name}.jpg"
+
+        if not mask_source_path.exists():
+            raise FileNotFoundError(f"mask source image not found: {mask_source_path}")
+
         total_frames = int(self.video_data.get(cv2.CAP_PROP_FRAME_COUNT))
         print(f"[Info] Video total frames: {total_frames}")
 
@@ -296,6 +310,7 @@ class ETHLoader():
         max_f = int(all_frames.max())
         print(f"[Info] Labeled frame range: [{min_f}, {max_f}]")
 
+        # 颜色表 (BGR) + 行人固定颜色映射（跨窗口保持一致）
         color_palette = [
             (0, 255, 0),
             (0, 0, 255),
@@ -314,8 +329,8 @@ class ETHLoader():
         for start_f in tqdm(window_starts, desc="Dumping windows"):
             end_f = start_f + window_size - 1
 
-            in_window = (traj_data[:, FRAME_COL] >= start_f) & (traj_data[:, FRAME_COL] <= end_f)
-            win_rows = traj_data[in_window]
+            in_win = (traj_data[:, FRAME_COL] >= start_f) & (traj_data[:, FRAME_COL] <= end_f)
+            win_rows = traj_data[in_win]
             if win_rows.shape[0] == 0:
                 continue
 
@@ -325,6 +340,7 @@ class ETHLoader():
                 print(f"[Warn] now_f {now_f} out of video range [0, {total_frames-1}], skip window")
                 continue
 
+            # 读取 now_f 对应的视频帧
             self.video_data.set(cv2.CAP_PROP_POS_FRAMES, now_f)
             success, frame = self.video_data.read()
             if not success or frame is None:
@@ -347,6 +363,7 @@ class ETHLoader():
                 agent_map.setdefault(pid, []).append({"frame": f, "x": x, "y": y})
 
             agents_list = [{"id": pid, "trajectory": agent_map[pid]} for pid in sorted(agent_map.keys())]
+
             window_record = {
                 "window_start": int(start_f),
                 "window_end": int(end_f),
@@ -354,7 +371,7 @@ class ETHLoader():
                 "agents": agents_list,
             }
 
-            # 2) 图片：只标注 now_f 这一帧出现的行人位置 + id
+            # 2) 画图：只标注 now_f 这一帧出现的行人位置 + id
             now_rows = win_rows_sorted[win_rows_sorted[:, FRAME_COL].astype(int) == now_f]
             if now_rows.shape[0] > 0:
                 now_rows = now_rows[np.argsort(now_rows[:, ID_COL].astype(int))]
@@ -382,40 +399,28 @@ class ETHLoader():
                     cv2.LINE_AA,
                 )
 
-            # 2.5) GT 图：在 now_f 的原始帧上，画出窗口内所有行人的完整轨迹（polyline）
-            gt_frame = frame.copy()  # 用已标注 now_f 的 frame 当底图也可以；不想带点/ID就改成原始帧备份
-            for pid in sorted(agent_map.keys()):
-                traj = agent_map[pid]
-                if len(traj) < 2:
-                    continue
-
-                if pid not in id2color:
-                    id2color[pid] = color_palette[len(id2color) % len(color_palette)]
-                color = id2color[pid]
-
-                pts = np.array([[t["x"], t["y"]] for t in traj], dtype=np.int32)
-                # 防止越界
-                pts[:, 0] = np.clip(pts[:, 0], 0, W_img - 1)
-                pts[:, 1] = np.clip(pts[:, 1], 0, H_img - 1)
-                pts = pts.reshape(-1, 1, 2)
-
-                cv2.polylines(gt_frame, [pts], isClosed=False, color=color, thickness=2)
-
             # 3) 保存：每个窗口单独子文件夹
             case_name = f"case_{start_f:06d}"
-            case_dir = os.path.join(save_dir, case_name)
-            os.makedirs(case_dir, exist_ok=True)
+            case_dir = Path(save_dir) / case_name
+            case_dir.mkdir(parents=True, exist_ok=True)
 
-            img_path = os.path.join(case_dir, f"{case_name}.jpg")
-            json_path = os.path.join(case_dir, f"{case_name}_scenario.json")
-            gt_path = os.path.join(case_dir, "case_gt.jpg")
-
-            cv2.imwrite(img_path, frame)
-            cv2.imwrite(gt_path, gt_frame)
+            # 3.1 保存窗口 JSON（文件名与 case_name 保持一致）
+            json_path = case_dir / f"{case_name}.json"
             with open(json_path, "w", encoding="utf-8") as jf:
                 json.dump(window_record, jf, ensure_ascii=False, indent=2)
 
+            # 3.2 保存带行人标记的原图：固定命名为 case_scenario.jpg
+            scenario_img_path = case_dir / "case_scenario.jpg"
+            cv2.imwrite(str(scenario_img_path), frame)
+
+            # 3.3 拷贝固定 mask：每个窗口都复制同一张 A/scenario.jpg 到 case_mask.jpg
+            #     若 mask_src_dir=None，则跳过（不报错）
+            if mask_source_path is not None:
+                dst_mask_path = case_dir / "case_mask.jpg"
+                shutil.copy2(str(mask_source_path), str(dst_mask_path))
+
         print(f"[Done] Window records dumped to {save_dir}")
+
 
 
    
@@ -450,6 +455,8 @@ if __name__ == "__main__":
 
         data_loader.generate_window_records(
             save_dir=str(scenario_out_dir),
+            scenario_name=scenario,
+            mask_src_dir='ETH_datasets/',
             window_size=200,
             stride=200,
             radius=4,

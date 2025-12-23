@@ -1,0 +1,6 @@
+#single run usage#
+
+python run_single_agent.py \
+  --sys prompts/system.md \
+  --user prompts/user.md \
+  --case_dir processed_data/ETH/case_000780 \
