@@ -20,6 +20,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)  
 DATA_ROOT = os.path.join(PROJECT_ROOT, "ETH_datasets")
 
+def color_for_id_rgb3(pid: int) -> tuple[int, int, int]:
+    """
+    Stable 3-color cycle (BGR):
+      pid%3==0 -> Green
+      pid%3==1 -> Red
+      pid%3==2 -> Blue
+    """
+    colors = [
+        (0, 255, 0),   # Green (BGR)
+        (0, 0, 255),   # Red
+        (255, 0, 0),   # Blue
+    ]
+    return colors[int(pid) % 3]
+
+
 class ETHLoader():
     def __init__(self, datasets_path, video_path):
         self.datasets_path = datasets_path
@@ -80,195 +95,7 @@ class ETHLoader():
                     target_obs.append(tmp[0:20, :])
         self.target_obs = np.asarray(target_obs)
                
-    def generate_each_frame_image(self, save_dir, frame_interval: int = 5, radius: int = 4, ):
-        os.makedirs(save_dir, exist_ok=True)
 
-        traj_data = self.processed_data
-        # 假定列为 [frame, id, x_pixel, y_pixel, ...]
-        FRAME_COL = 0
-        ID_COL = 1
-        X_COL = 2
-        Y_COL = 3
-
-        # 所有出现过的帧号（按升序）
-        all_frames = np.unique(traj_data[:, FRAME_COL].astype(int))
-        all_frames = np.sort(all_frames)
-
-        # 视频总帧数（仅用于检查）
-        total_frames = int(self.video_data.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"[Info] Video total frames: {total_frames}")
-        print(f"[Info] Unique frames in txt: {len(all_frames)}")
-
-        # 间隔采样：每隔 frame_interval 个“标注帧”取一张
-        sampled_frames = all_frames[::frame_interval]
-        print(f"[Info] Sampled frames: {len(sampled_frames)} (interval={frame_interval})")
-
-        for f in tqdm(sampled_frames, desc="Dumping annotated frames"):
-            frame_idx = int(f)
-            if frame_idx < 0 or frame_idx >= total_frames:
-                # 有些数据集会有 offset，这里先简单跳过超界的
-                print(f"[Warn] frame {frame_idx} 越界，total={total_frames}，跳过")
-                continue
-
-            # 定位到对应帧并读取
-            self.video_data.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            success, frame = self.video_data.read()
-            if not success or frame is None:
-                print(f"[Warn] 无法读取 frame {frame_idx}，跳过")
-                continue
-
-            H_img, W_img = frame.shape[:2]
-
-            # 当前帧的所有行人
-            rows = traj_data[traj_data[:, FRAME_COL] == f]
-
-            for row in rows:
-                pid = int(row[ID_COL])
-                px = int(round(row[X_COL]))
-                py = int(round(row[Y_COL]))
-
-                if not (0 <= px < W_img and 0 <= py < H_img):
-                    continue
-
-                # 画一个圆点（绿色）标在行人位置
-                cv2.circle(frame, (px, py), radius, (0, 255, 0), thickness=-1)
-                # 在旁边写上 id（可选）
-                cv2.putText(frame, str(pid), (px + 5, py - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
-
-            # 保存图像
-            save_name = os.path.join(save_dir, f"frame_{frame_idx:06d}.jpg")
-            cv2.imwrite(save_name, frame)
-
-        print(f"[Done] 共导出 {len(sampled_frames)} 张标注帧到 {save_dir}")
-
-    def generate_each_frame_with_his_image(self, save_dir, frame_interval: int = 5, radius: int = 4):
-        os.makedirs(save_dir, exist_ok=True)
-
-        traj_data = self.processed_data
-        # 假定列为 [frame, id, x_pixel, y_pixel, ...]
-        FRAME_COL = 0
-        ID_COL = 1
-        X_COL = 2
-        Y_COL = 3
-
-        # 所有出现过的帧号（按升序）
-        all_frames = np.unique(traj_data[:, FRAME_COL].astype(int))
-        all_frames = np.sort(all_frames)
-
-        # 视频总帧数（仅用于检查）
-        total_frames = int(self.video_data.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"[Info] Video total frames: {total_frames}")
-        print(f"[Info] Unique frames in txt: {len(all_frames)}")
-
-        # 间隔采样: 每隔 frame_interval 个“标注帧”取一张
-        sampled_frames = all_frames[::frame_interval]
-        print(f"[Info] Sampled frames: {len(sampled_frames)} (interval={frame_interval})")
-
-        # 颜色表 (BGR)
-        color_palette = [
-            (0, 255, 0),
-            (0, 0, 255),
-            (255, 0, 0),
-            (0, 255, 255),
-            (255, 255, 0),
-            (255, 0, 255),
-            (128, 255, 0),
-            (128, 0, 255),
-            (0, 128, 255),
-            (255, 128, 0),
-        ]
-        id2color = {}
-
-        for f in tqdm(sampled_frames, desc="Dumping annotated frames"):
-            frame_idx = int(f)
-            if frame_idx < 0 or frame_idx >= total_frames:
-                print(f"[Warn] frame {frame_idx} 越界, total={total_frames}, 跳过")
-                continue
-
-            # 定位到对应帧并读取
-            self.video_data.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            success, frame = self.video_data.read()
-            if not success or frame is None:
-                print(f"[Warn] 无法读取 frame {frame_idx}, 跳过")
-                continue
-
-            H_img, W_img = frame.shape[:2]
-
-            # 当前帧的所有行人
-            rows_current = traj_data[traj_data[:, FRAME_COL] == f]
-
-            # 按行人 id 排序
-            if rows_current.shape[0] > 0:
-                order = np.argsort(rows_current[:, ID_COL].astype(int))
-                rows_current = rows_current[order]
-
-            # 当前帧 JSON 里要写的列表
-            json_agents = []
-
-            for row in rows_current:
-                pid = int(row[ID_COL])
-
-                # 为每个行人分配固定颜色
-                if pid not in id2color:
-                    color = color_palette[len(id2color) % len(color_palette)]
-                    id2color[pid] = color
-                color = id2color[pid]
-
-                # 该行人到当前帧为止的历史轨迹 (frame <= f)
-                history_rows = traj_data[
-                    (traj_data[:, ID_COL] == pid) &
-                    (traj_data[:, FRAME_COL] <= f)
-                ]
-                history_rows = history_rows[np.argsort(history_rows[:, FRAME_COL])]
-
-                if history_rows.shape[0] >= 2:
-                    hist_xy = history_rows[:, [X_COL, Y_COL]].astype(int)
-                    hist_xy[:, 0] = np.clip(hist_xy[:, 0], 0, W_img - 1)
-                    hist_xy[:, 1] = np.clip(hist_xy[:, 1], 0, H_img - 1)
-                    pts = hist_xy.reshape(-1, 1, 2)
-                    cv2.polylines(frame, [pts], isClosed=False, color=color, thickness=2)
-
-                # 当前帧的位置
-                px = int(round(row[X_COL]))
-                py = int(round(row[Y_COL]))
-                if not (0 <= px < W_img and 0 <= py < H_img):
-                    continue
-
-                # 当前点与 id
-                cv2.circle(frame, (px, py), radius, color, thickness=-1)
-                cv2.putText(
-                    frame,
-                    str(pid),
-                    (px + 5, py - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
-
-                json_agents.append({
-                    "id": pid,
-                    "x": px,
-                    "y": py,
-                    "frame": int(row[FRAME_COL]),
-                })
-
-            # 保存图像
-            img_path = os.path.join(save_dir, f"frame_{frame_idx:06d}.jpg")
-            cv2.imwrite(img_path, frame)
-
-            # 保存 JSON（agents 已按 id 排序）
-            json_path = os.path.join(save_dir, f"frame_{frame_idx:06d}.json")
-            frame_record = {
-                "frame_id": frame_idx,
-                "agents": json_agents,
-            }
-            with open(json_path, "w", encoding="utf-8") as jf:
-                json.dump(frame_record, jf, ensure_ascii=False, indent=2)
-
-        print(f"[Done] 共导出 {len(sampled_frames)} 张标注帧到 {save_dir}")
 
     def generate_window_records(
         self,
@@ -279,9 +106,19 @@ class ETHLoader():
         radius: int = 4,
         mask_src_dir: str | None = None,
         mask_keyword: str = "mask",  # 保留参数但不再使用（兼容你原来的调用）
-            ) -> None:
+    ) -> None:
+        """
+        Window export with filtering + start/end markers.
 
-   
+        Changes:
+        - Filter: only keep agents whose trajectory length within this window > 5 frames (i.e., >= 6 points).
+        - Visualization: for each kept agent, draw:
+            - polyline across window
+            - start point marker (filled circle)
+            - end point marker (filled circle, slightly larger)
+            - optional id text near end point
+        - The saved JSON also only contains these kept agents.
+        """
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -295,12 +132,13 @@ class ETHLoader():
             raise ValueError("self.processed_data is empty")
 
         # =========================
-        # 固定拷贝的 mask 源文件（只做一次检查）
+        # Fixed mask source (optional)
         # =========================
-        mask_source_path = Path(mask_src_dir).resolve() / scenario_name / f"{scenario_name}.jpg"
-
-        if not mask_source_path.exists():
-            raise FileNotFoundError(f"mask source image not found: {mask_source_path}")
+        mask_source_path = None
+        if mask_src_dir:
+            mask_source_path = (Path(mask_src_dir).resolve() / scenario_name / f"{scenario_name}.jpg")
+            if not mask_source_path.exists():
+                raise FileNotFoundError(f"mask source image not found: {mask_source_path}")
 
         total_frames = int(self.video_data.get(cv2.CAP_PROP_FRAME_COUNT))
         print(f"[Info] Video total frames: {total_frames}")
@@ -310,20 +148,20 @@ class ETHLoader():
         max_f = int(all_frames.max())
         print(f"[Info] Labeled frame range: [{min_f}, {max_f}]")
 
-        # 颜色表 (BGR) + 行人固定颜色映射（跨窗口保持一致）
-        color_palette = [
-            (0, 255, 0),
-            (0, 0, 255),
-            (255, 0, 0),
-            (0, 255, 255),
-            (255, 255, 0),
-            (255, 0, 255),
-            (128, 255, 0),
-            (128, 0, 255),
-            (0, 128, 255),
-            (255, 128, 0),
-        ]
-        id2color: dict[int, tuple[int, int, int]] = {}
+        # Color palette (BGR) + persistent id->color
+        # color_palette = [
+        #     (0, 255, 0),
+        #     (0, 0, 255),
+        #     (255, 0, 0),
+        #     (0, 255, 255),
+        #     (255, 255, 0),
+        #     (255, 0, 255),
+        #     (128, 255, 0),
+        #     (128, 0, 255),
+        #     (0, 128, 255),
+        #     (255, 128, 0),
+        # ]
+        # id2color: dict[int, tuple[int, int, int]] = {}
 
         window_starts = list(range(min_f, max_f + 1, stride))
         for start_f in tqdm(window_starts, desc="Dumping windows"):
@@ -334,13 +172,13 @@ class ETHLoader():
             if win_rows.shape[0] == 0:
                 continue
 
-            # 窗口当前帧：窗口内最后一个标注帧
+            # Window "current" frame = last labeled frame in window
             now_f = int(win_rows[:, FRAME_COL].max())
             if now_f < 0 or now_f >= total_frames:
                 print(f"[Warn] now_f {now_f} out of video range [0, {total_frames-1}], skip window")
                 continue
 
-            # 读取 now_f 对应的视频帧
+            # Read the now_f frame as background
             self.video_data.set(cv2.CAP_PROP_POS_FRAMES, now_f)
             success, frame = self.video_data.read()
             if not success or frame is None:
@@ -349,11 +187,11 @@ class ETHLoader():
 
             H_img, W_img = frame.shape[:2]
 
-            # 窗口内按 (frame, id) 排序，便于稳定写 JSON
+            # Sort by (frame, id) for stable aggregation
             order = np.lexsort((win_rows[:, ID_COL].astype(int), win_rows[:, FRAME_COL].astype(int)))
             win_rows_sorted = win_rows[order]
 
-            # 1) JSON：聚合窗口内所有行人轨迹（按 id 排序）
+            # 1) Aggregate trajectories within window
             agent_map: dict[int, list[dict]] = {}
             for row in win_rows_sorted:
                 pid = int(row[ID_COL])
@@ -362,8 +200,15 @@ class ETHLoader():
                 y = int(round(row[Y_COL]))
                 agent_map.setdefault(pid, []).append({"frame": f, "x": x, "y": y})
 
-            agents_list = [{"id": pid, "trajectory": agent_map[pid]} for pid in sorted(agent_map.keys())]
+            # =========================
+            # Filter: keep only agents with >5 frames in this window
+            # =========================
+            kept_agent_ids = [pid for pid, traj in agent_map.items() if len(traj) > 5]
+            if len(kept_agent_ids) == 0:
+                continue
 
+            # JSON only for kept agents (sorted by id)
+            agents_list = [{"id": pid, "trajectory": agent_map[pid]} for pid in sorted(kept_agent_ids)]
             window_record = {
                 "window_start": int(start_f),
                 "window_end": int(end_f),
@@ -371,27 +216,38 @@ class ETHLoader():
                 "agents": agents_list,
             }
 
-            # 2) 画图：只标注 now_f 这一帧出现的行人位置 + id
-            now_rows = win_rows_sorted[win_rows_sorted[:, FRAME_COL].astype(int) == now_f]
-            if now_rows.shape[0] > 0:
-                now_rows = now_rows[np.argsort(now_rows[:, ID_COL].astype(int))]
-
-            for row in now_rows:
-                pid = int(row[ID_COL])
-                x = int(round(row[X_COL]))
-                y = int(round(row[Y_COL]))
-                if not (0 <= x < W_img and 0 <= y < H_img):
+            # =========================
+            # 2) Visualization: draw full window trajectories for kept agents
+            #    + mark start/end points
+            # =========================
+            for pid in sorted(kept_agent_ids):
+                traj = agent_map[pid]
+                if len(traj) == 0:
                     continue
 
-                if pid not in id2color:
-                    id2color[pid] = color_palette[len(id2color) % len(color_palette)]
-                color = id2color[pid]
+                color = color_for_id_rgb3(pid)
 
-                cv2.circle(frame, (x, y), radius, color, thickness=-1)
+                pts = np.array([[t["x"], t["y"]] for t in traj], dtype=np.int32)
+                pts[:, 0] = np.clip(pts[:, 0], 0, W_img - 1)
+                pts[:, 1] = np.clip(pts[:, 1], 0, H_img - 1)
+
+                # Polyline
+                if len(pts) >= 2:
+                    cv2.polylines(frame, [pts.reshape(-1, 1, 2)], isClosed=False, color=color, thickness=2)
+
+                # Start/End markers
+                sx, sy = int(pts[0, 0]), int(pts[0, 1])
+                ex, ey = int(pts[-1, 0]), int(pts[-1, 1])
+
+                cv2.circle(frame, (sx, sy), radius, color, thickness=-1)              # start
+                r = radius + 1
+                cv2.rectangle(frame, (ex - r, ey - r), (ex + r, ey + r), color, thickness=-1)
+
+                # Put id near the end point
                 cv2.putText(
                     frame,
                     str(pid),
-                    (x + 5, y - 5),
+                    (ex + 5, ey - 5),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     color,
@@ -399,22 +255,22 @@ class ETHLoader():
                     cv2.LINE_AA,
                 )
 
-            # 3) 保存：每个窗口单独子文件夹
+            # =========================
+            # 3) Save per-window folder
+            # =========================
             case_name = f"case_{start_f:06d}"
             case_dir = Path(save_dir) / case_name
             case_dir.mkdir(parents=True, exist_ok=True)
 
-            # 3.1 保存窗口 JSON（文件名与 case_name 保持一致）
+            # 3.1 JSON
             json_path = case_dir / f"{case_name}.json"
-            with open(json_path, "w", encoding="utf-8") as jf:
-                json.dump(window_record, jf, ensure_ascii=False, indent=2)
+            json_path.write_text(json.dumps(window_record, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            # 3.2 保存带行人标记的原图：固定命名为 case_scenario.jpg
+            # 3.2 annotated scenario image
             scenario_img_path = case_dir / "case_scenario.jpg"
             cv2.imwrite(str(scenario_img_path), frame)
 
-            # 3.3 拷贝固定 mask：每个窗口都复制同一张 A/scenario.jpg 到 case_mask.jpg
-            #     若 mask_src_dir=None，则跳过（不报错）
+            # 3.3 copy fixed mask (optional)
             if mask_source_path is not None:
                 dst_mask_path = case_dir / "case_mask.jpg"
                 shutil.copy2(str(mask_source_path), str(dst_mask_path))

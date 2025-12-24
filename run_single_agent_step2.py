@@ -42,7 +42,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4096"))
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 # 你说 keywords 写死是有目的的：保持不改
-KEYWORDS = ["mask", "scenario",]  # 按顺序找图片
+KEYWORDS = ["select",]  # 按顺序找图片
 
 
 
@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
 async def main_single_call_async(args: argparse.Namespace) -> None:
     # 0) case_dir and scene.json
     case_dir = Path(args.case_dir).resolve()
-    scene_json_path = case_dir / f"{case_dir.name}.json"  # e.g., case_000780/case_000780.json
+    scene_json_path = case_dir / "gpt_output_filtered_dict.json"  # e.g., case_000780/case_000780.json
 
 
     # 1) images: ordered by fixed keywords (search in case_dir)
@@ -211,67 +211,90 @@ async def main_single_call_async(args: argparse.Namespace) -> None:
     out_text = resp.output_text or ""
 
     # # 8) Save to file (case_dir/output.json)
-    out_path = Path(args.case_dir).resolve() / "gpt_output.json"
+    out_path = Path(args.case_dir).resolve() / "gpt_output_step2.json"
     out_path.write_text(out_text, encoding="utf-8")
 
-    # ====== 9) Load GPT output (util) ======
-    gpt_trajs = load_gpt_output_candidates(out_path)
+        # ====== 9) Load Step2 output (worldlines) ======
+    if not out_text.strip():
+        print("[Warn] resp.output_text is empty, skip visualization.")
+        return
 
-    # ====== 10) Filter by mask (util) ======
-    mask_path = case_dir / "case_mask.jpg"
-    if not mask_path.exists():
-        raise FileNotFoundError(f"case_mask.jpg not found: {mask_path}")
+    try:
+        step2_obj = json.loads(out_text)
+    except json.JSONDecodeError as e:
+        print("[Error] step2 output is not valid JSON:", e)
+        return
 
-    filtered_trajs, report = filter_trajs_by_walkable_mask(
-        trajs_by_agent=gpt_trajs,
-        mask_path=mask_path,
-        walkable_is_white=True,  # 若你mask黑色可走白色不可走，则改成 False
-        threshold=128,
-    )
+    worldlines = step2_obj.get("worldlines", [])
+    if not isinstance(worldlines, list) or len(worldlines) == 0:
+        print("[Warn] No worldlines found in step2 output. Expect key 'worldlines'.")
+        return
 
-    # ====== 11) Save filtered + report (不做额外结构转换) ======
-    # 注意：dict[int,...] dump 时 key 会变成字符串，这是 JSON 规范行为，读回时再转回 int 就行
-    filtered_out_path = case_dir / "gpt_output_filtered_dict.json"
-    filtered_out_path.write_text(
-        json.dumps(filtered_trajs, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    report_path = case_dir / "gpt_output_report.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # ====== 12) Visualize (util) ======
+    # ====== 10) Decide background image for visualization ======
+    # Prefer case_scenario.jpg; fallback to your selected image (KEYWORDS=["select"])
     scenario_img_path = case_dir / "case_scenario.jpg"
-    if not scenario_img_path.exists():
-        raise FileNotFoundError(f"case_scenario.jpg not found: {scenario_img_path}")
+    if scenario_img_path.exists():
+        bg_img = scenario_img_path
+    else:
+        if len(image_paths) == 0:
+            raise FileNotFoundError("No image found for visualization (case_scenario.jpg missing and image_paths empty).")
+        bg_img = Path(image_paths[0])
 
-    # 原始轨迹：如果你没有就传 None；如果你有 path.json 里能抽，就自己写一个 extractor
-    # 这里先最简：不画原始轨迹
-    vis_out_path = case_dir / "vis_gpt_trajs.jpg"
-    _ = visualize_trajs_on_scenario(
-        scenario_img=scenario_img_path,
-        original_trajs=None,
-        gpt_trajs_by_agent=gpt_trajs,
-        out_path=vis_out_path,
-        draw_points=False,
-        draw_agent_id=True,
-    )
-    vis_out_path = case_dir / "vis_select_trajs.jpg"
-    _ = visualize_trajs_on_scenario(
-        scenario_img=scenario_img_path,
-        original_trajs=None,
-        gpt_trajs_by_agent=filtered_trajs,
-        out_path=vis_out_path,
-        draw_points=False,
-        draw_agent_id=True,
-    )
+    # ====== 11) Visualize each worldline and save one image per worldline ======
+    # Save to: case_dir/worldline_001.jpg, worldline_002.jpg, ...
+    for k, wl in enumerate(worldlines, start=1):
+        agents = wl.get("agents", [])
+        if not isinstance(agents, list) or len(agents) == 0:
+            print(f"[Warn] worldline {k} has no agents, skip.")
+            continue
 
-    print(f"[Saved] raw={out_path}")
-    print(f"[Saved] filtered_dict={filtered_out_path}")
-    print(f"[Saved] report={report_path}")
-    print(f"[Saved] vis={vis_out_path}")
-    print(f"[Filter] kept {report.get('kept_candidates')}/{report.get('total_candidates')}, "
-        f"ratio={report.get('overall_keep_ratio')}")
+        # Convert into the format expected by visualize_trajs_on_scenario:
+        # gpt_trajs_by_agent: dict[int, list[list[(x,y)]]]
+        gpt_trajs_by_agent = {}
+        for a in agents:
+            aid = a.get("agent_id", None)
+            pts = a.get("points", None)
+            if aid is None or pts is None:
+                continue
+            try:
+                aid_int = int(aid)
+            except Exception:
+                # 如果 agent_id 不是 int，也可以直接用字符串，但你的可视化函数通常按 int 上色
+                # 这里尽量转 int；转不了就跳过
+                continue
+
+            # pts: [[x,y], ...] -> [(x,y), ...]
+            traj = []
+            for p in pts:
+                if not (isinstance(p, (list, tuple)) and len(p) == 2):
+                    continue
+                x, y = int(round(p[0])), int(round(p[1]))
+                traj.append((x, y))
+
+            if len(traj) >= 2:
+                gpt_trajs_by_agent[aid_int] = [traj]  # 只有 1 条被选轨迹，也用 list 包起来
+
+        if len(gpt_trajs_by_agent) == 0:
+            print(f"[Warn] worldline {k}: no valid trajectories parsed, skip.")
+            continue
+
+        out_img_path = case_dir / f"worldline_{k:03d}.jpg"
+
+        # original_trajs=None 表示不叠加原始轨迹，只画该 worldline 选择的轨迹
+        visualize_trajs_on_scenario(
+            scenario_img=bg_img,
+            original_trajs=None,
+            gpt_trajs_by_agent=gpt_trajs_by_agent,
+            out_path=out_img_path,
+            draw_points=False,
+            draw_agent_id=True,
+            origin_thickness=3,
+            cand_thickness=2,
+            point_radius=2,
+        )
+
+    print(f"[Done] Saved {len(worldlines)} worldline visualizations under: {case_dir}")
+
 
 def main() -> None:
     args = parse_args()

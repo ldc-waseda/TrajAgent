@@ -246,6 +246,19 @@ def filter_trajs_by_walkable_mask(
 
     return filtered, report
 
+def color_for_id_rgb3(pid: int) -> tuple[int, int, int]:
+    """
+    Stable 3-color cycle (BGR):
+      pid%3==0 -> Green
+      pid%3==1 -> Red
+      pid%3==2 -> Blue
+    """
+    colors = [
+        (0, 255, 0),   # Green (BGR)
+        (0, 0, 255),   # Red
+        (255, 0, 0),   # Blue
+    ]
+    return colors[int(pid) % 3]
 
 def visualize_trajs_on_scenario(
     scenario_img: Union[str, Path, np.ndarray],
@@ -306,30 +319,11 @@ def visualize_trajs_on_scenario(
         return (int(np.clip(x, 0, W - 1)), int(np.clip(y, 0, H - 1)))
 
     def _color_for_id(agent_id: int) -> Tuple[int, int, int]:
-        # 稳定颜色, BGR
-        palette = [
-            (0, 255, 0),
-            (0, 0, 255),
-            (255, 0, 0),
-            (0, 255, 255),
-            (255, 255, 0),
-            (255, 0, 255),
-            (128, 255, 0),
-            (128, 0, 255),
-            (0, 128, 255),
-            (255, 128, 0),
-            (0, 200, 100),
-            (200, 100, 0),
-            (100, 200, 0),
-            (0, 100, 200),
-            (200, 0, 100),
-            (100, 0, 200),
-        ]
-        return palette[agent_id % len(palette)]
+        return color_for_id_rgb3(agent_id)
 
-    def _dim_color(c: Tuple[int, int, int], factor: float = 0.6) -> Tuple[int, int, int]:
-        b, g, r = c
-        return (int(b * factor), int(g * factor), int(r * factor))
+    # def _dim_color(c: Tuple[int, int, int], factor: float = 0.6) -> Tuple[int, int, int]:
+    #     b, g, r = c
+    #     return (int(b * factor), int(g * factor), int(r * factor))
 
     def _draw_polyline(points: Traj, color: Tuple[int, int, int], thickness: int) -> None:
         if len(points) < 2:
@@ -360,7 +354,7 @@ def visualize_trajs_on_scenario(
     # 2) draw GPT candidates first (thin, dim color)
     for agent_id, cand_list in gpt_trajs_by_agent.items():
         base = _color_for_id(agent_id)
-        cand_color = _dim_color(base, 0.55)
+        cand_color = base
 
         for traj in cand_list:
             _draw_polyline(traj, cand_color, cand_thickness)

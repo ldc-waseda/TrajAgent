@@ -1,6 +1,12 @@
 #single run usage#
+python3 -m data_loader.eth_data_loader_updated 
 
 python run_single_agent.py \
   --sys prompts/system.md \
-  --user prompts/user.md \
-  --case_dir processed_data/ETH/case_000780 \
+  --user prompts/user_step1.md \
+  --case_dir processed_data/ETH/case_000780 
+
+python run_single_agent_step2.py \
+  --sys prompts/system.md \
+  --user prompts/user_step2.md \
+  --case_dir processed_data/ETH/case_000780 
