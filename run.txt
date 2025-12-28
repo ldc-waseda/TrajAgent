@@ -10,3 +10,15 @@ python run_single_agent_step2.py \
   --sys prompts/system.md \
   --user prompts/user_step2.md \
   --case_dir processed_data/ETH/case_000780 
+
+python run_single_agent.py \
+  --sys prompts/system.md \
+  --user prompts/user_step1.md \
+  --case_dir processed_data/ETH \
+  --max_concurrency 30 \
+
+python run_single_agent2.py \
+  --sys prompts/system.md \
+  --user prompts/user_step2.md \
+  --case_dir processed_data/ETH \
+  --max_concurrency 30 

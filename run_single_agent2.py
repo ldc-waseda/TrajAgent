@@ -1,20 +1,22 @@
 """
-TrajAgent 单次调用框架 (Responses API, multimodal input)
+TrajAgent Step2 批量调用框架 (Responses API, multimodal input)
 
-核心流程:
+支持:
+- --case_dir 传单个 case 文件夹 或 根目录(包含多个 case_* 子目录)
+- 并发执行 (asyncio + semaphore)
+- 可选跳过已存在的 gpt_output_step2.json
+
+核心流程(每个 case):
 1 读取 system.md / user.md (纯文本)
-2 读取 scene_json (结构化输入)
-3 根据关键词在目录中按顺序选取图片 (保证第1张mask, 第2张xx, 第3张BB)
-4 用 build_input_items_separated 构造 Responses API input
-5 调用 client.responses.create 并打印输出
+2 读取 gpt_output_filtered_dict.json (结构化输入)
+3 按 KEYWORDS 在 case_dir 内顺序选图 (用于 SCENE_IMAGES)
+4 构造 separated input items
+5 调用 client.responses.create 得到 step2 json
+6 保存 gpt_output_step2.json
+7 解析 worldlines 并可视化 worldline_001.jpg, worldline_002.jpg, ...
 
 依赖:
   pip install -U openai
-
-环境变量:
-  OPENAI_API_KEY: 必填
-  OPENAI_BASE_URL: 可选
-  OPENAI_MODEL: 可选, 默认 gpt-5-mini
 """
 
 from __future__ import annotations
@@ -26,9 +28,10 @@ import json
 import mimetypes
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
-from agent.agent_util import *
+from typing import Any, Dict, List, Sequence, Tuple
+
 from openai import AsyncOpenAI
+from agent.agent_util import *  # visualize_trajs_on_scenario 等
 
 
 # =========================
@@ -36,15 +39,13 @@ from openai import AsyncOpenAI
 # =========================
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-# DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "1"))
-DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))
+DEFAULT_MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4096"))
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 # 你说 keywords 写死是有目的的：保持不改
-KEYWORDS = ["mask", "scenario",]  # 按顺序找图片
-
+KEYWORDS = ["select"]  # 按顺序找图片
 
 
 # =========================
@@ -52,26 +53,19 @@ KEYWORDS = ["mask", "scenario",]  # 按顺序找图片
 # =========================
 
 def read_text_file(path: str) -> str:
-    """读取纯文本文件，返回去掉首尾空白后的文本。"""
     return Path(path).read_text(encoding="utf-8").strip()
 
 
 def read_json_file(path: str | Path) -> Dict[str, Any]:
-    """读取 JSON 文件并返回 dict。"""
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def image_path_to_data_url(path: str) -> str:
-    """
-    读取本地图片并转成 base64 data URL，供 Responses API 的 input_image 使用。
-    """
     mime, _ = mimetypes.guess_type(path)
     if mime is None:
         mime = "image/png"
-
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
-
     return f"data:{mime};base64,{b64}"
 
 
@@ -80,12 +74,6 @@ def build_input_items_separated(
     scene_json_obj: Dict[str, Any],
     image_paths: Sequence[str],
 ) -> List[Dict[str, Any]]:
-    """
-    Build Responses API 'input' with separated blocks:
-      1) user instructions (from user.md) - pure text
-      2) scene JSON - pure text
-      3) images - input_image list (ordered)
-    """
     input_items: List[Dict[str, Any]] = []
 
     # 1) user prompt text
@@ -119,10 +107,6 @@ def build_input_items_separated(
 # =========================
 
 def find_one_image_by_keyword(images_dir: str, keyword: str) -> str:
-    """
-    在 images_dir 下找一个文件名包含 keyword 的图片（不区分大小写）。
-    若匹配多张，取按文件名排序后的第一张（稳定可复现）。
-    """
     d = Path(images_dir)
     if not d.exists() or not d.is_dir():
         raise FileNotFoundError(f"images_dir not found or not a directory: {images_dir}")
@@ -144,16 +128,11 @@ def find_one_image_by_keyword(images_dir: str, keyword: str) -> str:
 
 
 def build_ordered_image_paths_by_keywords(images_dir: str, keywords: Sequence[str]) -> List[str]:
-    """
-    根据关键词列表生成有序 image_paths：
-      keywords = ["mask","xx","BB"]
-      -> [mask图, xx图, BB图]
-    """
     return [find_one_image_by_keyword(images_dir, kw) for kw in keywords]
 
 
 # =========================
-# 3) main
+# 3) 批量入口
 # =========================
 
 def parse_args() -> argparse.Namespace:
@@ -171,36 +150,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", dest="temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--max_tokens", dest="max_output_tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
 
-    # 并发控制，建议 1-4 之间
     p.add_argument("--max_concurrency", type=int, default=int(os.getenv("MAX_CONCURRENCY", "2")))
-    # 批量时只扫 case_* 目录
     p.add_argument("--case_glob", type=str, default="case_*")
-    # 已经有输出就跳过
-    p.add_argument("--skip_existing", action="store_true", help="skip case if gpt_output.json exists")
+    p.add_argument("--skip_existing", action="store_true", help="skip case if gpt_output_step2.json exists")
 
     return p.parse_args()
 
 
-# ====== 新增: 自动发现要跑的 case 目录 ======
 def discover_case_dirs(root_or_case: Path, case_glob: str = "case_*") -> List[Path]:
     """
-    如果传入的是单个 case 文件夹: 里面存在 {case_name}.json 就认为是 case
-    如果传入的是根目录: 就枚举其子目录 case_* 作为 case
+    单 case 判定:
+      - 存在 gpt_output_filtered_dict.json (Step2 输入) 则认为是 case
+    根目录判定:
+      - 枚举其子目录 case_* 作为 case
     """
     p = root_or_case.resolve()
     if not p.exists() or not p.is_dir():
         raise FileNotFoundError(f"case_dir not found or not a directory: {p}")
 
-    # 单 case 判定: case_dir/case_dir.name.json 存在
-    single_json = p / f"{p.name}.json"
-    if single_json.exists():
+    # 单 case 判定
+    step2_input = p / "gpt_output_filtered_dict.json"
+    if step2_input.exists():
         return [p]
 
     # 否则按 glob 找子 case
     case_dirs = [x for x in sorted(p.glob(case_glob)) if x.is_dir()]
     return case_dirs
 
-# ====== 新增: 单个 case 的处理逻辑封装成函数 ======
+
 async def process_one_case(
     case_dir: Path,
     *,
@@ -209,123 +186,130 @@ async def process_one_case(
     user_text: str,
     args: argparse.Namespace,
     semaphore: asyncio.Semaphore,
-) -> tuple[bool, str]:
-    """
-    返回 (ok, msg)
-    ok=True 表示成功
-    """
+) -> Tuple[bool, str]:
     async with semaphore:
         try:
             case_dir = case_dir.resolve()
 
-            # 可选跳过
-            out_path = case_dir / "gpt_output.json"
+            out_path = case_dir / "gpt_output_step2.json"
             if args.skip_existing and out_path.exists() and out_path.stat().st_size > 0:
-                return True, f"[Skip] {case_dir.name} already has gpt_output.json"
+                return True, f"[Skip] {case_dir.name} already has gpt_output_step2.json"
 
-            # 0) scene json 固定为 case_xxx.json
-            scene_json_path = case_dir / f"{case_dir.name}.json"
+            # Step2 输入 json 固定
+            scene_json_path = case_dir / "gpt_output_filtered_dict.json"
             if not scene_json_path.exists():
-                return False, f"[Fail] {case_dir.name} missing scene json: {scene_json_path.name}"
+                return False, f"[Fail] {case_dir.name} missing gpt_output_filtered_dict.json"
 
-            # 1) images: ordered by fixed keywords (search in case_dir)
+            # images: ordered by fixed keywords (search in case_dir)
             image_paths = build_ordered_image_paths_by_keywords(str(case_dir), KEYWORDS)
 
-            # 2) read scene json
+            # read scene json
             scene_json_obj = read_json_file(scene_json_path)
 
-            # 3) build separated input items
+            # build separated input items
             input_items = build_input_items_separated(
                 user_md_text=user_text,
                 scene_json_obj=scene_json_obj,
                 image_paths=image_paths,
             )
 
-            # 4) call Responses API
+            # call Responses API
             resp = await client.responses.create(
                 model=args.model,
                 instructions=system_text,
                 input=input_items,
                 temperature=args.temperature,
                 max_output_tokens=args.max_output_tokens,
-                reasoning={"effort": "none"},
+                reasoning={"effort": "minimal"},
                 text={"format": {"type": "json_object"}},
             )
 
             out_text = resp.output_text or ""
             out_path.write_text(out_text, encoding="utf-8")
 
-            # 5) Load GPT output (util)
-            gpt_trajs = load_gpt_output_candidates(out_path)
+            if not out_text.strip():
+                return False, f"[Fail] {case_dir.name} resp.output_text is empty"
 
-            # 6) Filter by mask (util)
-            mask_path = case_dir / "case_mask.jpg"
-            if not mask_path.exists():
-                return False, f"[Fail] {case_dir.name} missing case_mask.jpg"
+            try:
+                step2_obj = json.loads(out_text)
+            except json.JSONDecodeError as e:
+                return False, f"[Fail] {case_dir.name} step2 output is not valid JSON: {repr(e)}"
 
-            filtered_trajs, report = filter_trajs_by_walkable_mask(
-                trajs_by_agent=gpt_trajs,
-                mask_path=mask_path,
-                walkable_is_white=True,
-                threshold=128,
-            )
+            worldlines = step2_obj.get("worldlines", [])
+            if not isinstance(worldlines, list) or len(worldlines) == 0:
+                return False, f"[Fail] {case_dir.name} no worldlines found (expect key 'worldlines')"
 
-            # 7) Save filtered + report
-            filtered_out_path = case_dir / "gpt_output_filtered_dict.json"
-            filtered_out_path.write_text(
-                json.dumps(filtered_trajs, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-            report_path = case_dir / "gpt_output_report.json"
-            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            # 8) Visualize (util)
+            # background image for visualization
             scenario_img_path = case_dir / "case_base_map.jpg"
-            if not scenario_img_path.exists():
-                return False, f"[Fail] {case_dir.name} missing case_base_map.jpg"
+            if scenario_img_path.exists():
+                bg_img = scenario_img_path
+            else:
+                if len(image_paths) == 0:
+                    return False, f"[Fail] {case_dir.name} no images found for visualization fallback"
+                bg_img = Path(image_paths[0])
 
-            vis_raw_path = case_dir / "vis_gpt_trajs.jpg"
-            _ = visualize_trajs_on_scenario(
-                scenario_img=scenario_img_path,
-                original_trajs=None,
-                gpt_trajs_by_agent=gpt_trajs,
-                out_path=vis_raw_path,
-                draw_points=False,
-                draw_agent_id=True,
-            )
+            # visualize each worldline
+            saved = 0
+            for k, wl in enumerate(worldlines, start=1):
+                agents = wl.get("agents", [])
+                if not isinstance(agents, list) or len(agents) == 0:
+                    continue
 
-            vis_sel_path = case_dir / "vis_select_trajs.jpg"
-            _ = visualize_trajs_on_scenario(
-                scenario_img=scenario_img_path,
-                original_trajs=None,
-                gpt_trajs_by_agent=filtered_trajs,
-                out_path=vis_sel_path,
-                draw_points=False,
-                draw_agent_id=True,
-            )
+                gpt_trajs_by_agent = {}
+                for a in agents:
+                    aid = a.get("agent_id", None)
+                    pts = a.get("points", None)
+                    if aid is None or pts is None:
+                        continue
+                    try:
+                        aid_int = int(aid)
+                    except Exception:
+                        continue
 
-            kept = report.get("kept_candidates")
-            total = report.get("total_candidates")
-            ratio = report.get("overall_keep_ratio")
-            return True, f"[OK] {case_dir.name} kept={kept}/{total} ratio={ratio}"
+                    traj = []
+                    for pxy in pts:
+                        if not (isinstance(pxy, (list, tuple)) and len(pxy) == 2):
+                            continue
+                        x, y = int(round(pxy[0])), int(round(pxy[1]))
+                        traj.append((x, y))
+
+                    if len(traj) >= 2:
+                        gpt_trajs_by_agent[aid_int] = [traj]
+
+                if len(gpt_trajs_by_agent) == 0:
+                    continue
+
+                out_img_path = case_dir / f"worldline_{k:03d}.jpg"
+                visualize_trajs_on_scenario(
+                    scenario_img=bg_img,
+                    original_trajs=None,
+                    gpt_trajs_by_agent=gpt_trajs_by_agent,
+                    out_path=out_img_path,
+                    draw_points=False,
+                    draw_agent_id=True,
+                    origin_thickness=3,
+                    cand_thickness=2,
+                    point_radius=2,
+                )
+                saved += 1
+
+            return True, f"[OK] {case_dir.name} worldlines={len(worldlines)} vis_saved={saved}"
 
         except Exception as e:
             return False, f"[Fail] {case_dir.name} exception: {repr(e)}"
 
 
-# ====== 修改: main 改成批量入口 ======
 async def main_batch_async(args: argparse.Namespace) -> None:
     root = Path(args.case_dir).resolve()
     case_dirs = discover_case_dirs(root, args.case_glob)
     if not case_dirs:
         raise RuntimeError(f"No case dirs found under: {root} (glob={args.case_glob})")
 
-    # 读 prompts 只做一次
+    # prompts only once
     system_text = read_text_file(args.sys_prompt_path)
     user_text = read_text_file(args.user_prompt_path)
 
-    # client 复用
+    # shared client
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         base_url=os.environ.get("OPENAI_BASE_URL"),

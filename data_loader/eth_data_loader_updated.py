@@ -98,15 +98,15 @@ class ETHLoader():
 
 
     def generate_window_records(
-        self,
-        save_dir: str,
-        scenario_name: str = "eth",
-        window_size: int = 200,
-        stride: int | None = None,
-        radius: int = 4,
-        mask_src_dir: str | None = None,
-        mask_keyword: str = "mask",  # 保留参数但不再使用（兼容你原来的调用）
-    ) -> None:
+            self,
+            save_dir: str,
+            scenario_name: str = "eth",
+            window_size: int = 200,
+            stride: int | None = None,
+            radius: int = 4,
+            mask_src_dir: str | None = None,
+            mask_keyword: str = "mask",  # 保留参数但不再使用（兼容你原来的调用）
+            ) -> None:
         """
         Window export with filtering + start/end markers.
 
@@ -115,10 +115,11 @@ class ETHLoader():
         - Visualization: for each kept agent, draw:
             - polyline across window
             - start point marker (filled circle)
-            - end point marker (filled circle, slightly larger)
+            - end point marker (filled square)
             - optional id text near end point
         - The saved JSON also only contains these kept agents.
-        """
+        - NEW: also save the raw frame-0 image as case_base_map.jpg in each case folder.
+    """
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -148,21 +149,6 @@ class ETHLoader():
         max_f = int(all_frames.max())
         print(f"[Info] Labeled frame range: [{min_f}, {max_f}]")
 
-        # Color palette (BGR) + persistent id->color
-        # color_palette = [
-        #     (0, 255, 0),
-        #     (0, 0, 255),
-        #     (255, 0, 0),
-        #     (0, 255, 255),
-        #     (255, 255, 0),
-        #     (255, 0, 255),
-        #     (128, 255, 0),
-        #     (128, 0, 255),
-        #     (0, 128, 255),
-        #     (255, 128, 0),
-        # ]
-        # id2color: dict[int, tuple[int, int, int]] = {}
-
         window_starts = list(range(min_f, max_f + 1, stride))
         for start_f in tqdm(window_starts, desc="Dumping windows"):
             end_f = start_f + window_size - 1
@@ -178,8 +164,16 @@ class ETHLoader():
                 print(f"[Warn] now_f {now_f} out of video range [0, {total_frames-1}], skip window")
                 continue
 
-            # Read the now_f frame as background
-            self.video_data.set(cv2.CAP_PROP_POS_FRAMES, now_f)
+            # ====== NEW: read raw frame 0 (base map) ======
+            self.video_data.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok0, base_map = self.video_data.read() # (480 640 related2 height x weidth)
+            print(base_map.shape)
+            if not ok0 or base_map is None:
+                print(f"[Warn] failed to read video frame 0, skip window")
+                continue
+
+            # ====== read now_f frame for drawing ======
+            self.video_data.set(cv2.CAP_PROP_POS_FRAMES, 0)
             success, frame = self.video_data.read()
             if not success or frame is None:
                 print(f"[Warn] failed to read video frame {now_f}, skip window")
@@ -239,9 +233,9 @@ class ETHLoader():
                 sx, sy = int(pts[0, 0]), int(pts[0, 1])
                 ex, ey = int(pts[-1, 0]), int(pts[-1, 1])
 
-                cv2.circle(frame, (sx, sy), radius, color, thickness=-1)              # start
+                cv2.circle(frame, (sx, sy), radius, color, thickness=-1)  # start
                 r = radius + 1
-                cv2.rectangle(frame, (ex - r, ey - r), (ex + r, ey + r), color, thickness=-1)
+                cv2.rectangle(frame, (ex - r, ey - r), (ex + r, ey + r), color, thickness=-1)  # end (square)
 
                 # Put id near the end point
                 cv2.putText(
@@ -270,12 +264,17 @@ class ETHLoader():
             scenario_img_path = case_dir / "case_scenario.jpg"
             cv2.imwrite(str(scenario_img_path), frame)
 
-            # 3.3 copy fixed mask (optional)
+            # 3.3 NEW: save base map (raw frame0)
+            base_map_path = case_dir / "case_base_map.jpg"
+            cv2.imwrite(str(base_map_path), base_map)
+
+            # 3.4 copy fixed mask (optional)
             if mask_source_path is not None:
                 dst_mask_path = case_dir / "case_mask.jpg"
                 shutil.copy2(str(mask_source_path), str(dst_mask_path))
 
         print(f"[Done] Window records dumped to {save_dir}")
+
 
 
 
