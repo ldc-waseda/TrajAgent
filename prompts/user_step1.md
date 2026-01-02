@@ -1,32 +1,67 @@
 Task
 For each agent in SCENE_JSON:
-- The goal (square marker) is FIXED.
-- Generate 5 alternative world-lines by:
-  1) Randomly choosing a start point on the WALKABLE_MASK (white) , far from the goal when possible.
-  2) Planning a smooth pedestrian path from this start to the fixed goal.
+- Generate 3 alternative world-lines by producing ONLY:
+  - a random START point (walkable,  and safe)
+  - a mid point that lies on a safe walkable pixel and serves as a smooth connector between start and end: it should be located along the natural corridor route so that the polyline start → mid → end forms a gentle, human-like turn (no sharp angle), preferably near corridor midlines / wide junction areas to keep clearance from boundaries.
+  - an END point that within walkable area
 
-Spatial hints (walkable layout prior, based on WALKABLE_MASK):
-- The walkable area forms a large “I”-shaped corridor system.
-- Top region: a long horizontal corridor spans across the upper part of the image (upper band). It has a wide central junction area, and two arms extending to the left and to the right. The safest walking area is near the middle of this horizontal band (avoid the jagged/diagonal borders on both sides).
-- Middle region: from the top central junction, a wide vertical corridor goes downward through the center of the image (a straight “stem”). Prefer the centerline of this stem for safety margin.
-- Bottom region: the vertical stem widens into a broader “foot/plaza” near the bottom, with an additional small extension towards the bottom-right. This bottom area is generally more spacious and safer than the narrow edges.
-- Non-walkable space (black) occupies most of the left and right sides; do not attempt shortcuts through black regions. Most valid routes should flow through the top horizontal band, the central junction, and/or the central vertical stem.
-- Waypoint suggestion: choose waypoints inside the wide top junction and along the midlines of the horizontal arms / vertical stem to maintain smooth, human-like paths with good boundary clearance.
+Do NOT output trajectories or intermediate points. Output points only.
 
-Rules
-- Starts must be valid walkable pixels and mutually far apart (diverse).
-- All points must stay inside the walkable region with a safety margin.
-- Paths must be smooth and human-like (curvature-limited).
+Inputs
+1) SCENE_JSON: includes agent_id list and recorded traj for each agent.
+2) WALKABLE_MASK: walkable pixels are bright/white, forbidden pixels are dark/black.
+3) Current Window image: reference only for motion pattern (heading trend / speed level / turning tendency). Do NOT copy the exact path.
 
-Return JSON only:
+Coordinate system (OpenCV cv2, MUST follow)
+- origin: (0,0) at top-left
+- x increases right, y increases down
+- point format: [x,y] as integer pixel coordinates
+- bounds: 0 <= x < W, 0 <= y < H
+
+Hard constraints (MUST NEVER violate)
+1) Walkability
+   Every output point (ALL starts and ALL ends) must be on walkable pixels in WALKABLE_MASK.
+
+2) Safety preference (strong)
+   Avoid boundary hugging (jagged/diagonal borders). Prefer corridor centerlines and wide junction areas.
+
+
+Batch validation rule (MANDATORY)
+- You MUST validate ALL points in ONE batch tool call:
+  check_walkable_pixel(points=[[x,y], ...])
+- This batch must include ALL starts and ALL ends for ALL agents (5 world-lines per agent).
+- Do NOT call the tool one point at a time.
+- If any invalid points are found, resample/repair and batch-check again until ALL points are valid.
+
+World-line generation requirements
+1) Per agent: exactly 3 world-lines.
+2) Start diversity:
+   - Starts must be mutually far apart (large pairwise distances) for the same agent.
+3) Motion imitation (soft):
+   - Infer each agent’s motion direction/turning style from the Current Window trajectories.
+   - Sample starts and ends consistent with that style (do NOT copy the exact trajectory).
+
+Spatial hints (walkable layout prior from WALKABLE_MASK)
+- Walkable area is a large “I”-shaped corridor system.
+- Top region: long horizontal corridor; safest near its middle.
+- Middle region: wide vertical corridor (“stem”) downward from top junction; prefer centerline.
+- Bottom region: widened plaza/foot near bottom, plus small extension bottom-right.
+- Black regions dominate left/right: no shortcuts; prefer corridor/junction interior.
+
+Output (STRICT: JSON only, no extra text)
 {
   "agents": [
     {
       "agent_id": <id>,
       "candidates": [
-        { "start": [x,y], "goal": [x,y], "points": [[x,y], ... , [x_goal,y_goal]] },
+        { "points": [x,y], "points": [x,y], "points": [x,y] },
         ...
+        (total 3)
       ]
-    }
+    },
+    ...
   ]
 }
+
+Final reminder
+- Only output JSON AFTER all starts and ends are batch-validated as walkable.

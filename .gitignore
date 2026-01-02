@@ -3,4 +3,6 @@ processed_sliding_window_data/
 ETH_datasets/
 .my_env
 bash.txt
+visual_language.egg-info/
 **/__pycache__/
+run.txt
